@@ -36,6 +36,9 @@ UI 上也就看不到。
 
 登录态保存在 `cache/cloud_wuwa_chrome`，下次免登录。
 
+输入是通过 Playwright 注入的 DOM 事件（`browser.keyboard / browser.mouse`），云游戏页面
+会正常接收——实测按 `Escape` 能在云游戏里打开终端菜单。
+
 ## 已知限制
 
 - **仅 Windows**。
@@ -51,7 +54,8 @@ ok-script 原生的浏览器设备用 Windows Graphics Capture 抓窗口，而 W
 任务侧只会反复打印 `no frame available` 并把任务跳过。本插件因此做了两处改动：
 
 1. **帧源改成 `page.screenshot(type="jpeg")`**，直接读合成后的页面，与窗口是否变化无关。
-   实测静止页面 30+ fps；窗口被 ok-ww 全屏盖住时仍有约 39 fps（遮挡不影响）。
+   插件抓帧路径实测 **约 21 fps**（1280x720 / jpeg q70）。窗口被 ok-ww 全屏盖住时不受影响
+   （实测遮挡前后页面都在实时刷新，diff 119 / 132）。
 2. **浏览器只启动一次**。启动时先读 profile 里的 `DevToolsActivePort`，如果指向一个还活着的
    实例就 `connect_over_cdp` 接上去，不会再多开窗口；关闭抓帧时只断开连接、不关浏览器，
    所以再点「打开云鸣潮」会回到原来那个窗口，登录状态和游戏画面都还在。
@@ -60,6 +64,14 @@ ok-script 原生的浏览器设备用 Windows Graphics Capture 抓窗口，而 W
 还原它。正常使用（ok-ww 全屏覆盖浏览器）不触发这个情况。
 
 想彻底关掉浏览器，用「云鸣潮」页的「关闭浏览器」按钮。
+
+### 为什么不用推送式帧源
+
+试过 CDP 的 `Page.startScreencast`：静止页面只有 **1 fps**，和 WGC 是同一个毛病——只在画面
+变化时才推帧，同样会让任务卡在 `no frame available`。按需截图是这里唯一可行的方案。
+
+原始 CDP `Page.captureScreenshot` 比 `page.screenshot` 快约 30%（28 fps vs 21 fps），
+但需要在插件里额外管理一条 CDP 会话的生命周期；21 fps 已足够驱动任务，故不采用。
 
 ## 配置持久化
 

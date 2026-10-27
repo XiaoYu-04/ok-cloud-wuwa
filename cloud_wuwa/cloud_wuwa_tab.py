@@ -160,6 +160,10 @@ def _ensure_browser(width, height):
             f"--user-data-dir={PROFILE_DIR}",
             f"--app={CLOUD_URL}",
             f"--window-size={width},{height}",
+            # 先开在屏幕外：ok-ww 启动时会自动拉起浏览器，若开在屏幕中央，每次启动
+            # 都会闪出一个独立的云鸣潮窗口，几秒后才被挂进标签页。挂进宿主时会被
+            # 重新定位，所以这个初始坐标不影响内嵌；离屏状态下 CDP 截图照常出帧。
+            "--window-position=-32000,-32000",
             "--no-first-run",
             "--no-default-browser-check",
             "--force-device-scale-factor=1",
@@ -244,6 +248,45 @@ def _restore_if_minimized():
     except Exception as e:
         logger.warning(f"restore cloud browser failed: {e}")
     return False
+
+
+def _bring_on_screen(hwnd):
+    """浏览器开在屏幕外（等内嵌）却没被嵌进去时，把它挪回屏幕中央给用户用。"""
+    try:
+        import win32gui
+    except ImportError:
+        return
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        if left > -10000 and top > -10000:
+            return
+        win_w, win_h = right - left, bottom - top
+        screen_w = win32gui.GetSystemMetrics(0)
+        screen_h = win32gui.GetSystemMetrics(1)
+        x = max((screen_w - win_w) // 2, 0)
+        y = max((screen_h - win_h) // 2, 0)
+        logger.info(f"move cloud browser back on screen to ({x}, {y})")
+        win32gui.SetWindowPos(hwnd, None, x, y, win_w, win_h, 0x0014)  # NOZORDER|NOACTIVATE
+    except Exception as e:
+        logger.warning(f"move cloud browser on screen failed: {e}")
+
+
+def _park_offscreen(hwnd):
+    """把窗口挪到屏幕外，但保持「可见」。
+
+    不能隐藏：_find_chrome_window 只认可见窗口，藏了就再也找不到、下次启动无法
+    重新挂回标签页。放在屏幕外既能达到「看不见」的效果，又保留了可发现性。
+    """
+    try:
+        import win32gui
+    except ImportError:
+        return
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return
+        win32gui.SetWindowPos(hwnd, None, -32000, -32000, 0, 0, 0x0015)  # NOSIZE|NOZORDER|NOACTIVATE
+    except Exception as e:
+        logger.warning(f"park cloud browser failed: {e}")
 
 
 def _find_chrome_window(pid):
@@ -721,6 +764,8 @@ class CloudBrowserCapture(BrowserCaptureMethod):
             logger.warning("cloud browser window not found, cannot embed")
             return False
         if not self._embedded.attach(hwnd, host_hwnd):
+            # 挂不进来就得让用户还能直接用它，否则它留在屏幕外等于打不开
+            _bring_on_screen(hwnd)
             return False
         self.embed_scale = None
         return True
@@ -748,7 +793,11 @@ class CloudBrowserCapture(BrowserCaptureMethod):
     def close(self):
         """只断开连接，保留浏览器窗口与游戏画面，下次启动直接接回去。"""
         logger.info("CloudBrowserCapture detach")
+        hwnd = self._embedded.hwnd or _find_browser_window()
         self._embedded.detach()
+        # 断开后窗口会回到桌面：先挪到屏幕外，否则下次启动 ok-ww 拉起它以后，
+        # 在挂进标签页之前用户会看到桌面上多一个云鸣潮窗口。
+        _park_offscreen(hwnd)
         self._cdp = None
         if self.loop.is_running():
             try:
@@ -869,12 +918,18 @@ class CloudWuwaTab(CustomTab):
         return capture if isinstance(capture, CloudBrowserCapture) else None
 
     def _place_embedded(self):
-        """把内嵌窗口摆到承载区的 16:9 可用范围内。"""
+        """把内嵌窗口摆到承载区的 16:9 可用范围内。
+
+        承载区的 size() 是 Qt 逻辑像素，而子窗口的 SetWindowPos 收的是设备像素。
+        高分屏（125%/150%）下后者更大，直接拿逻辑像素去摆，画面就只铺满左上角
+        一块，右边和下边留黑。
+        """
         capture = self._capture()
         if capture is None or not capture.embedded:
             return
+        ratio = self.screen.devicePixelRatioF()
         size = self.screen.size()
-        capture.set_display_area(size.width(), size.height())
+        capture.set_display_area(round(size.width() * ratio), round(size.height() * ratio))
 
     def _try_embed(self):
         """浏览器就绪后调用：把它的窗口挂进本页。失败就保持独立窗口。"""

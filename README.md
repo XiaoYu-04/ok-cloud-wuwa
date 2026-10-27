@@ -22,7 +22,7 @@ UI 上也就看不到。
 ## 安装
 
 1. 打开 ok-ww → 左侧栏「插件」→「从 ZIP 导入」
-2. 选择 `dist/cloud_wuwa-1.0.0.okscript`
+2. 选择 `dist/cloud_wuwa-1.1.0.okscript`
 3. 重启 ok-ww
 
 重启后左侧栏会出现「云鸣潮」页。
@@ -34,16 +34,32 @@ UI 上也就看不到。
 3. 回到「截图方式」页，「选择窗口」里选中「云鸣潮」
 4. 像本地游戏一样启动任务
 
-登录态保存在 `cache/playwright`，下次免登录。
+登录态保存在 `cache/cloud_wuwa_chrome`，下次免登录。
 
 ## 已知限制
 
-- **仅 Windows**。依赖 WGC（Windows 10 2004+）。
+- **仅 Windows**。
 - **需要系统装有 Chrome 或 Edge**。
 - `supported_resolution` 要求 16:9，所以请保持 1280x720 / 1600x900 / 1920x1080 / 2560x1440。
 - 云游戏串流画质受网络影响，OCR 识别率可能不如本地。
-- 浏览器窗口被最小化或完全遮挡时 WGC 可能抓不到帧，保持窗口可见即可。
-- 交互方式是 `BrowserInteraction`（Playwright 注入），不是 PostMessage；后台运行时浏览器窗口不要最小化。
+- 交互方式是 `BrowserInteraction`（Playwright 注入），不是 PostMessage。
+
+## 帧源与浏览器复用
+
+ok-script 原生的浏览器设备用 Windows Graphics Capture 抓窗口，而 WGC 只在窗口内容
+**发生变化**时才推帧。云鸣潮的登录页、加载页、静态界面一旦停住就完全不出帧，
+任务侧只会反复打印 `no frame available` 并把任务跳过。本插件因此做了两处改动：
+
+1. **帧源改成 `page.screenshot(type="jpeg")`**，直接读合成后的页面，与窗口是否变化无关。
+   实测静止页面 30+ fps；窗口被 ok-ww 全屏盖住时仍有约 39 fps（遮挡不影响）。
+2. **浏览器只启动一次**。启动时先读 profile 里的 `DevToolsActivePort`，如果指向一个还活着的
+   实例就 `connect_over_cdp` 接上去，不会再多开窗口；关闭抓帧时只断开连接、不关浏览器，
+   所以再点「打开云鸣潮」会回到原来那个窗口，登录状态和游戏画面都还在。
+
+只有当浏览器被最小化时，Chromium 会暂停渲染，截图会挂住——插件检测到窗口最小化会自动
+还原它。正常使用（ok-ww 全屏覆盖浏览器）不触发这个情况。
+
+想彻底关掉浏览器，用「云鸣潮」页的「关闭浏览器」按钮。
 
 ## 配置持久化
 
@@ -54,8 +70,9 @@ ok-ww 会直接尝试启动浏览器设备。想切回本地游戏，在「选�
 
 ```powershell
 # 打包
-C:\Apps\Local\ok-ww\data\apps\ok-ww\python\python.exe build_okscript.py
+C:\Apps\Local\ok-ww\data\apps\ok-ww\python\python.exe scripts\build_okscript.py
 ```
 
 产物在 `dist/`。脚本会用 ok-script 自己的 `validate_plugin_manifest` 和
 `validate_archive` 校验一遍。
+

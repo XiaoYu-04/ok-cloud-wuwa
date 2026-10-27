@@ -401,16 +401,60 @@ class EmbeddedChild:
         logger.info(f"embedded browser hwnd={hwnd} into host={host_hwnd}")
         return True
 
+    def page_pads(self):
+        """页面四周的窗口装饰厚度 (left, top, right, bottom)。
+
+        Chrome 把网页画在自己的子窗口 Chrome_RenderWidgetHostHWND 里，它的矩形
+        就是页面位置——比硬编码「描边 7px + 标题栏 30px」可靠：这些厚度随 DPI 和
+        窗口样式变化，实测 125% 缩放下是 left 9 / top 37 / right 17 / bottom 8，
+        按常量摆就会裁掉页面的一部分。找不到子窗口时退回常量。
+        """
+        fallback = (EMBED_PAGE_LEFT, EMBED_PAGE_TOP, EMBED_PAGE_LEFT,
+                    EMBED_OVERHEAD_H - EMBED_PAGE_TOP)
+        try:
+            import win32gui
+        except ImportError:
+            return fallback
+        if not self.hwnd or not win32gui.IsWindow(self.hwnd):
+            return fallback
+        found = []
+
+        def cb(h, _):
+            if win32gui.GetClassName(h) == "Chrome_RenderWidgetHostHWND":
+                found.append(h)
+            return True
+
+        try:
+            win32gui.EnumChildWindows(self.hwnd, cb, None)
+        except Exception:  # noqa: BLE001
+            return fallback
+        if not found:
+            return fallback
+        # 混进 0 尺寸的占位窗口时取面积最大的那个
+        best = None
+        for child in found:
+            rect = win32gui.GetWindowRect(child)
+            size = (rect[2] - rect[0]) * (rect[3] - rect[1])
+            if best is None or size > best[0]:
+                best = (size, rect)
+        _, rect = best
+        origin_x, origin_y = win32gui.ClientToScreen(self.hwnd, (0, 0))
+        win = win32gui.GetWindowRect(self.hwnd)
+        left = rect[0] - origin_x
+        top = rect[1] - origin_y
+        right = (origin_x + win[2] - win[0]) - rect[2]
+        bottom = (origin_y + win[3] - win[1]) - rect[3]
+        # 装饰厚度不该为负；异常时用常量兜底
+        if min(left, top, right, bottom) < 0:
+            return fallback
+        return left, top, right, bottom
+
     def place(self, x, y, shown_w, shown_h):
         """把页面摆到父窗口客户区的 (x, y)，显示尺寸为 shown_w x shown_h。
 
-        窗口比可见区域大一圈：左/右各 7px 描边、顶部 30px 自绘标题栏、底部 7px
-        描边。所以窗口要往左上各推 7/30，多出来的部分由父窗口客户区剪掉，剩下的
-        可见区域正好是页面。
-
-        光靠偏移不够：页面在承载区里垂直居中时 y 可能大于 30，标题栏又会落回
-        可见区域内，而 Chrome 对它返回 HTCAPTION——子窗口于是能被鼠标拖走。
-        所以再给窗口设一个只含页面的区域，把标题栏和描边从窗口自身切掉。
+        先量出页面四周装饰的厚度（见 page_pads），再让窗口整体偏移，使页面正好
+        落进目标矩形；窗口比页面大出来的描边和标题栏被推出父窗口客户区，再由
+        窗口区域从窗口自身切掉——后者同时消灭了「拖标题栏能把画面拖走」。
         """
         if not self.attached:
             return False
@@ -419,15 +463,16 @@ class EmbeddedChild:
             import win32gui
         except ImportError:
             return False
+        left, top, right, bottom = self.page_pads()
         win32gui.SetWindowPos(
-            self.hwnd, None, int(x) - EMBED_PAGE_LEFT, int(y) - EMBED_PAGE_TOP,
-            int(shown_w) + EMBED_OVERHEAD_W, int(shown_h) + EMBED_OVERHEAD_H,
+            self.hwnd, None, int(x) - left, int(y) - top,
+            int(shown_w) + left + right, int(shown_h) + top + bottom,
             win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_NOACTIVATE,
         )
-        self._apply_region(int(shown_w), int(shown_h))
+        self._apply_region(left, top, int(shown_w), int(shown_h))
         return True
 
-    def _apply_region(self, shown_w, shown_h):
+    def _apply_region(self, left, top, shown_w, shown_h):
         """把窗口区域裁成只剩页面那一块，标题栏和描边不再响应鼠标。"""
         try:
             import ctypes
@@ -435,8 +480,8 @@ class EmbeddedChild:
             return
         try:
             rgn = ctypes.windll.gdi32.CreateRectRgn(
-                EMBED_PAGE_LEFT, EMBED_PAGE_TOP,
-                EMBED_PAGE_LEFT + max(shown_w, 1), EMBED_PAGE_TOP + max(shown_h, 1),
+                left, top,
+                left + max(shown_w, 1), top + max(shown_h, 1),
             )
             if not ctypes.windll.user32.SetWindowRgn(self.hwnd, rgn, True):
                 ctypes.windll.gdi32.DeleteObject(rgn)
@@ -882,6 +927,7 @@ class CloudWuwaTab(CustomTab):
     def __init__(self):
         super().__init__()
         self.setObjectName("CloudWuwaTab")
+        self._last_area = None
 
         # 控件排成一行放最上面，把纵向空间尽量留给画面
         self.add_card("云鸣潮", self._build_controls())
@@ -905,17 +951,48 @@ class CloudWuwaTab(CustomTab):
         return FluentIcon.CLOUD
 
     def _build_screen(self):
-        """16:9 的黑底承载区：内嵌的浏览器窗口按它的大小缩放显示。"""
-        holder = QWidget()
-        holder.setMinimumSize(320, 180)
+        """黑底容器，里面套一个始终 16:9 的承载区。
+
+        承载区必须自己就是 16:9：窗口客户区的宽高比随窗口大小变化（实测 1.89、
+        1.64 都出现过），而页面永远是 16:9。若让页面去适配一个非 16:9 的区域，
+        min() 取到的缩放只贴合其中一边，另一边留出不对称的黑边——用户看到的就是
+        「没占满」。反过来先让承载区成为 16:9，页面便正好铺满，没有黑边。
+        """
+        frame = QWidget()
+        frame.setStyleSheet("background:#000;")
+        frame.setMinimumSize(320, 180)
+        self.screen_frame = frame
+        holder = QWidget(frame)
         holder.setStyleSheet("background:#000;")
         holder.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        # 尺寸变化时重排子窗口；标签页被切走再切回来也要重排一次
+        frame.resizeEvent = lambda event: self._layout_screen(event)
         holder.resizeEvent = self._on_screen_resized
         holder.showEvent = self._on_screen_shown
         holder.hideEvent = self._on_screen_hidden
         self.screen = holder
-        return holder
+        return frame
+
+    def _layout_screen(self, event):
+        """把承载区摆成容器内最大的 16:9 矩形并居中。"""
+        QWidget.resizeEvent(self.screen_frame, event)
+        frame = self.screen_frame
+        avail_w, avail_h = frame.width(), frame.height()
+        if avail_w < 16 or avail_h < 16:
+            return
+        width, height = self._aspect_size(avail_w, avail_h)
+        self.screen.setGeometry(
+            (avail_w - width) // 2, (avail_h - height) // 2, width, height
+        )
+
+    @staticmethod
+    def _aspect_size(avail_w, avail_h):
+        """在 avail_w x avail_h 内取最大的 16:9 尺寸。"""
+        width = avail_w
+        height = width * 9 // 16
+        if height > avail_h:
+            height = avail_h
+            width = height * 16 // 9
+        return max(width, 16), max(height, 9)
 
     def _on_screen_resized(self, event):
         QWidget.resizeEvent(self.screen, event)
@@ -938,19 +1015,32 @@ class CloudWuwaTab(CustomTab):
         capture = getattr(getattr(og, "device_manager", None), "capture_method", None)
         return capture if isinstance(capture, CloudBrowserCapture) else None
 
+    def _display_area(self):
+        """承载区在设备像素下的尺寸；子窗口的 SetWindowPos 收的是设备像素。"""
+        ratio = self.screen.devicePixelRatioF()
+        size = self.screen.size()
+        return round(size.width() * ratio), round(size.height() * ratio)
+
     def _place_embedded(self):
-        """把内嵌窗口摆到承载区的 16:9 可用范围内。
+        """把内嵌窗口摆到承载区里。
 
         承载区的 size() 是 Qt 逻辑像素，而子窗口的 SetWindowPos 收的是设备像素。
         高分屏（125%/150%）下后者更大，直接拿逻辑像素去摆，画面就只铺满左上角
         一块，右边和下边留黑。
+
+        承载区自己已经是 16:9（见 _build_screen），所以这里页面正好铺满，
+        不会出现一边贴边、另一边留黑的情况。
         """
         capture = self._capture()
         if capture is None or not capture.embedded:
             return
-        ratio = self.screen.devicePixelRatioF()
-        size = self.screen.size()
-        capture.set_display_area(round(size.width() * ratio), round(size.height() * ratio))
+        area = self._display_area()
+        shown = capture.set_display_area(*area)
+        self._last_area = area
+        logger.info(
+            f"cloud area device {area[0]}x{area[1]} shown {shown} "
+            f"scale={capture.embed_scale}"
+        )
 
     def _try_embed(self):
         """浏览器就绪后调用：把它的窗口挂进本页。失败就保持独立窗口。"""
@@ -1045,3 +1135,10 @@ class CloudWuwaTab(CustomTab):
         capture = self._capture()
         if capture is not None and capture.connected() and not capture.embedded:
             self._try_embed()
+            return
+        # 承载区尺寸变了但没收到 resizeEvent 的情况（例如整窗拖到不同 DPI 的显示器、
+        # 或者布局在事件之后才收敛），靠定时器兜底重摆一次。区域没变时是空操作。
+        if capture is not None and capture.embedded:
+            area = self._display_area()
+            if area != self._last_area:
+                self._place_embedded()

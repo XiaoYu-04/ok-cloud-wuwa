@@ -887,6 +887,10 @@ class CloudWuwaTab(CustomTab):
         if not capture.embed(int(self.screen.winId())):
             return False
         self._place_embedded()
+        # 子窗口不跟 Qt 的 z-order 走：本页当前没显示时必须立刻藏起来，
+        # 否则它会浮在整个 ok-ww 上面。showEvent 里会再露出来。
+        if not self.screen.isVisible():
+            capture.embedded_child.set_visible(False)
         return True
 
     def _build_controls(self):
@@ -959,3 +963,9 @@ class CloudWuwaTab(CustomTab):
         state = "已连接" if device.get("connected") else "未启动"
         preferred = "（已选中）" if device_manager.config.get("preferred") == "browser" else ""
         self.status_label.setText(f"云鸣潮 {state}{preferred}  {device.get('resolution')}")
+
+        # 浏览器可能是 ok-ww 启动时自己拉起来的（preferred=browser），这时没人点
+        # 按钮。只要抓帧器已经就绪而窗口还没挂进来，就补挂一次。
+        capture = self._capture()
+        if capture is not None and capture.connected() and not capture.embedded:
+            self._try_embed()

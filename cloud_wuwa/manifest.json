@@ -1,7 +1,7 @@
 {
     "file_name": "cloud_wuwa",
     "script_name": "云鸣潮",
-    "version": "1.3.0",
+    "version": "1.3.1",
     "custom_tabs": [
         ["cloud_wuwa_tab", "CloudWuwaTab"]
     ]

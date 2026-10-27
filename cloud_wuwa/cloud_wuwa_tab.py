@@ -196,6 +196,63 @@ def _restore_if_minimized():
     return False
 
 
+async def _fit_viewport(context, page, width, height):
+    """把客户区调成正好 width x height（CSS 像素）。
+
+    --window-size 设的是窗口外框，客户区会比它小一圈（实测 1280x720 外框的
+    客户区只有 1264x712）。页面若按 1280x720 排版而窗口只显示 1264x712，
+    右/下就被切掉，表现为「有时全有时不全」。
+
+    这里用 CDP 量出页面真实的 innerWidth/Height，按误差迭代修正窗口尺寸，
+    直到客户区精确等于目标值。不用 Win32 的 GetWindowRect——ok-ww 进程不是
+    DPI 感知的，拿到的是缩放后的虚拟坐标，按它换算会把窗口越调越大。
+    """
+    session = None
+    try:
+        session = await context.new_cdp_session(page)
+        window = await session.send("Browser.getWindowForTarget")
+        window_id = window["windowId"]
+        if window.get("bounds", {}).get("windowState") not in (None, "normal"):
+            await session.send(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"windowState": "normal"}},
+            )
+            await page.wait_for_timeout(200)
+
+        target_w, target_h = int(width), int(height)
+        actual = await page.evaluate("() => ({w: innerWidth, h: innerHeight})")
+        bound_w, bound_h = actual["w"], actual["h"]
+        for _ in range(4):
+            delta_w = target_w - actual["w"]
+            delta_h = target_h - actual["h"]
+            if delta_w == 0 and delta_h == 0:
+                break
+            bound_w += delta_w
+            bound_h += delta_h
+            await session.send(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": window_id,
+                    "bounds": {"width": bound_w, "height": bound_h, "windowState": "normal"},
+                },
+            )
+            await page.wait_for_timeout(200)
+            actual = await page.evaluate("() => ({w: innerWidth, h: innerHeight})")
+
+        logger.info(
+            f"cloud viewport fitted {actual['w']}x{actual['h']} "
+            f"target {target_w}x{target_h} window {bound_w}x{bound_h}"
+        )
+    except Exception as e:
+        logger.warning(f"fit viewport failed: {e}")
+    finally:
+        if session is not None:
+            try:
+                await session.detach()
+            except Exception:
+                pass
+
+
 class CloudBrowserCapture(BrowserCaptureMethod):
     """浏览器抓帧，帧源为 page.screenshot，且浏览器跨会话复用。"""
 
@@ -237,7 +294,10 @@ class CloudBrowserCapture(BrowserCaptureMethod):
                 logger.warning(f"goto {CLOUD_URL} failed: {e}")
 
         try:
-            await self.page.set_viewport_size({"width": width, "height": height})
+            # 不要用 set_viewport_size：它会覆盖真实窗口尺寸做设备模拟，
+            # 页面按 1280x720 排版而客户区只有 1264x681，内容被缩放/裁切，
+            # 表现为「有时全有时不全」。改为按边框差把客户区调准。
+            await _fit_viewport(context, self.page, width, height)
             await self.page.bring_to_front()
         except Exception as e:
             logger.warning(f"prepare page failed: {e}")
@@ -310,12 +370,12 @@ class CloudBrowserCapture(BrowserCaptureMethod):
         return self.page is not None and not self.page.is_closed()
 
     def resize(self, width, height):
-        """只改视口，不重开窗口。"""
+        """调整客户区尺寸，不重开窗口。"""
         self._size = (int(width), int(height))
 
         async def _apply():
             if self.page is not None and not self.page.is_closed():
-                await self.page.set_viewport_size({"width": self._size[0], "height": self._size[1]})
+                await _fit_viewport(self.browser.contexts[0], self.page, self._size[0], self._size[1])
 
         self.run_in_loop(_apply())
 

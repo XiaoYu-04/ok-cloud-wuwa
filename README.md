@@ -22,7 +22,7 @@ UI 上也就看不到。
 ## 安装
 
 1. 打开 ok-ww → 左侧栏「插件」→「从 ZIP 导入」
-2. 选择 `dist/cloud_wuwa-1.1.0.okscript`
+2. 选择 `dist/cloud_wuwa-1.1.1.okscript`
 3. 重启 ok-ww
 
 重启后左侧栏会出现「云鸣潮」页。
@@ -72,6 +72,21 @@ ok-script 原生的浏览器设备用 Windows Graphics Capture 抓窗口，而 W
 
 原始 CDP `Page.captureScreenshot` 比 `page.screenshot` 快约 30%（28 fps vs 21 fps），
 但需要在插件里额外管理一条 CDP 会话的生命周期；21 fps 已足够驱动任务，故不采用。
+
+## 画面被裁切的问题（1.1.1 修复）
+
+Chrome 的 `--window-size=1280,720` 设的是**窗口外框**，客户区实际只有 `1264x712`。
+页面若按 1280x720 排版，右/下就会被切掉一截——表现为「有时全有时不全」。
+
+原因是旧代码调用 `set_viewport_size(1280,720)` 做设备模拟，强制页面按 1280x720 排版，
+与真实客户区不符。现在改为**按 CDP 迭代把客户区调准**：量出页面 `innerWidth/Height`，
+按误差修正窗口尺寸，直到精确等于目标分辨率（实测收敛到 1280x720，外框 1296x759）。
+
+注意两个坑，都踩过：
+
+- 不能用 JS 的 `outerWidth - innerWidth` 算边框，Chrome `--app` 窗口报的是两者相等，差值恒为 0。
+- 不能用 Win32 `GetWindowRect` 算，ok-ww 进程不是 DPI 感知的，拿到的是缩放后的虚拟坐标，
+  按它换算会把窗口越调越大（实测被拉成 1616x908）。
 
 ## 配置持久化
 

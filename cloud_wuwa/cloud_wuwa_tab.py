@@ -20,6 +20,7 @@ import asyncio
 import io
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -40,9 +41,19 @@ logger = Logger.get_logger(__name__)
 
 CLOUD_URL = "https://mc.kurogames.com/cloud/#/"
 DEVICE_NICK = "云鸣潮"
-RESOLUTIONS = [(1280, 720), (1600, 900), (1920, 1080), (2560, 1440)]
+# 只列 16:9 档位：ok-ww 的 check_frame_and_resolution 要求画面比例与 config 的
+# supported_resolution.ratio 一致（容差 1%），且不小于 min_size 1280x720。
+# 1600x1000 / 1920x1200 / 2560x1080 这类尺寸虽然能达到，但会被比例校验直接判失败。
+RESOLUTIONS = [
+    (1280, 720), (1366, 768), (1440, 810), (1600, 900),
+    (1920, 1080), (2048, 1152), (2560, 1440),
+]
 DEFAULT_RESOLUTION = (1280, 720)
 JPEG_QUALITY = 70
+
+# Chrome --app 窗口的外框相对客户区的固定开销（实测各档位稳定为 16 / 39）
+FRAME_WIDTH = 16
+FRAME_HEIGHT = 39
 
 PROFILE_DIR = os.path.abspath(os.path.join("cache", "cloud_wuwa_chrome"))
 
@@ -66,6 +77,19 @@ def _find_browser_exe():
     return None
 
 
+def _port_open(port, timeout=0.4):
+    """端口是否有人在听。连不上要立刻返回，不能等 urlopen 超时。
+
+    端口无人监听时 urlopen 会一直等到超时（实测每次 1.5s），而
+    _ensure_browser 会反复轮询，启动流程就被拖住。
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _live_endpoint():
     """profile 里的 DevToolsActivePort 若指向活着的实例，返回 http 端点。"""
     marker = os.path.join(PROFILE_DIR, "DevToolsActivePort")
@@ -75,6 +99,13 @@ def _live_endpoint():
         with open(marker, encoding="utf-8") as handle:
             port = int(handle.readline().strip())
     except (OSError, ValueError):
+        return None
+    if not _port_open(port):
+        # 标记文件是上次运行留下的，端口早没了；清掉免得每次启动都白等
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
         return None
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1.5) as response:
@@ -196,6 +227,24 @@ def _restore_if_minimized():
     return False
 
 
+def _fit_16_9(width, height, avail_w, avail_h):
+    """把目标尺寸缩到屏幕放得下的最大 16:9 尺寸。
+
+    直接按可用宽高夹会破坏 16:9，画面比例校验照样失败，所以先按比例缩，
+    再对齐到 16 的整数倍。返回 (w, h, 是否缩过)。
+    """
+    limit_w, limit_h = avail_w - FRAME_WIDTH, avail_h - FRAME_HEIGHT
+    if width <= limit_w and height <= limit_h:
+        return width, height, False
+    scale = min(limit_w / width, limit_h / height)
+    scaled_w = int(width * scale) // 16 * 16
+    scaled_h = scaled_w // 16 * 9
+    if scaled_h > limit_h:
+        scaled_h = limit_h // 9 * 9
+        scaled_w = scaled_h // 9 * 16
+    return scaled_w, scaled_h, True
+
+
 async def _fit_viewport(context, page, width, height):
     """把客户区调成正好 width x height（CSS 像素）。
 
@@ -206,6 +255,9 @@ async def _fit_viewport(context, page, width, height):
     这里用 CDP 量出页面真实的 innerWidth/Height，按误差迭代修正窗口尺寸，
     直到客户区精确等于目标值。不用 Win32 的 GetWindowRect——ok-ww 进程不是
     DPI 感知的，拿到的是缩放后的虚拟坐标，按它换算会把窗口越调越大。
+
+    窗口放不下目标尺寸时（屏幕比目标小），迭代不会自动停：实测请求 3440x1440
+    会被撑到 6062x1513。所以先按可用工作区夹一次，并在尺寸失控时立即中止。
     """
     session = None
     try:
@@ -220,15 +272,30 @@ async def _fit_viewport(context, page, width, height):
             await page.wait_for_timeout(200)
 
         target_w, target_h = int(width), int(height)
+        screen = await page.evaluate("() => ({w: screen.availWidth, h: screen.availHeight})")
+        fit_w, fit_h, clamped = _fit_16_9(target_w, target_h, screen["w"], screen["h"])
+        if clamped:
+            logger.warning(
+                f"cloud viewport {target_w}x{target_h} larger than screen "
+                f"{screen['w']}x{screen['h']}, use {fit_w}x{fit_h}"
+            )
+
+        bound_w, bound_h = fit_w + FRAME_WIDTH, fit_h + FRAME_HEIGHT
         actual = await page.evaluate("() => ({w: innerWidth, h: innerHeight})")
-        bound_w, bound_h = actual["w"], actual["h"]
         for _ in range(4):
-            delta_w = target_w - actual["w"]
-            delta_h = target_h - actual["h"]
+            delta_w = fit_w - actual["w"]
+            delta_h = fit_h - actual["h"]
             if delta_w == 0 and delta_h == 0:
                 break
-            bound_w += delta_w
-            bound_h += delta_h
+            # delta 是相对当前实际客户区的修正量，必须叠在真实窗口尺寸上，
+            # 不能叠在理论目标上，否则会一路放大
+            bounds = await session.send("Browser.getWindowBounds", {"windowId": window_id})
+            bound_w = bounds["bounds"]["width"] + delta_w
+            bound_h = bounds["bounds"]["height"] + delta_h
+            # 屏幕限制下窗口可能永远达不到目标；继续加会把窗口越撑越大
+            if bound_w > screen["w"] + FRAME_WIDTH or bound_h > screen["h"] + FRAME_HEIGHT:
+                logger.warning(f"cloud viewport cannot reach {fit_w}x{fit_h}, keep {actual['w']}x{actual['h']}")
+                break
             await session.send(
                 "Browser.setWindowBounds",
                 {
@@ -243,8 +310,10 @@ async def _fit_viewport(context, page, width, height):
             f"cloud viewport fitted {actual['w']}x{actual['h']} "
             f"target {target_w}x{target_h} window {bound_w}x{bound_h}"
         )
+        return actual["w"], actual["h"]
     except Exception as e:
         logger.warning(f"fit viewport failed: {e}")
+        return None
     finally:
         if session is not None:
             try:
@@ -297,13 +366,19 @@ class CloudBrowserCapture(BrowserCaptureMethod):
             # 不要用 set_viewport_size：它会覆盖真实窗口尺寸做设备模拟，
             # 页面按 1280x720 排版而客户区只有 1264x681，内容被缩放/裁切，
             # 表现为「有时全有时不全」。改为按边框差把客户区调准。
-            await _fit_viewport(context, self.page, width, height)
+            fitted = await _fit_viewport(context, self.page, width, height)
+            if fitted and tuple(fitted) != self._size:
+                # 屏幕放不下目标尺寸时会被缩成别的 16:9 尺寸（如 2560x1440 ->
+                # 2384x1341）。设备登记的必须是真正生效的尺寸，否则 ok-ww 拿
+                # 登记值和实际帧比对，比例/尺寸对不上。
+                logger.info(f"effective resolution {self._size} -> {fitted}")
+                self._size = tuple(fitted)
             await self.page.bring_to_front()
         except Exception as e:
             logger.warning(f"prepare page failed: {e}")
 
         self._page_closed_notified = False
-        logger.info(f"CloudBrowserCapture attached {width}x{height} {self.page.url}")
+        logger.info(f"CloudBrowserCapture attached {self._size[0]}x{self._size[1]} {self.page.url}")
 
     def start_browser(self):
         """幂等启动：连续调用也只挂到一个浏览器上。"""
@@ -375,7 +450,13 @@ class CloudBrowserCapture(BrowserCaptureMethod):
 
         async def _apply():
             if self.page is not None and not self.page.is_closed():
-                await _fit_viewport(self.browser.contexts[0], self.page, self._size[0], self._size[1])
+                fitted = await _fit_viewport(self.browser.contexts[0], self.page, self._size[0], self._size[1])
+                if fitted:
+                    self._size = tuple(fitted)
+                    manager = getattr(og, "device_manager", None)
+                    if manager is not None and getattr(manager, "browser_config", None):
+                        manager.browser_config["resolution"] = self._size
+                        manager.update_browser_device()
 
         self.run_in_loop(_apply())
 
@@ -428,14 +509,18 @@ def install_browser_device(resolution=DEFAULT_RESOLUTION, nick=DEVICE_NICK):
     _patch_capture_class()
 
     capture = device_manager.capture_method
-    if isinstance(capture, CloudBrowserCapture) and tuple(getattr(capture, "_size", ())) != tuple(resolution):
-        logger.info(f"resolution {getattr(capture, '_size', None)} -> {resolution}")
-        capture.resize(*resolution)
+    effective = tuple(resolution)
+    if isinstance(capture, CloudBrowserCapture):
+        if tuple(getattr(capture, "_size", ())) != tuple(resolution):
+            logger.info(f"resolution {getattr(capture, '_size', None)} -> {resolution}")
+            capture.resize(*resolution)
+        # resize 可能因屏幕放不下而改小，登记的必须是真正生效的尺寸
+        effective = tuple(getattr(capture, "_size", resolution))
 
     device_manager.browser_config = {
         "url": CLOUD_URL,
         "nick": nick,
-        "resolution": resolution,
+        "resolution": effective,
     }
     device_manager.update_browser_device()
     return device_manager.device_dict.get("browser") is not None

@@ -19,13 +19,19 @@ UI 上也就看不到。
 
 **没有修改 ok-ww 仓库的任何代码。**
 
+> 注意：ok-script 原生的浏览器设备用 Windows Graphics Capture 抓帧，但 WGC 只在画面变化时
+> 才推帧，云游戏静止页面会长时间 0 帧导致任务全部跳过。本插件因此改用按需截图作为帧源，
+> 详见下面的「帧源与浏览器复用」。
+
 ## 安装
 
-1. 打开 ok-ww → 左侧栏「插件」→「从 ZIP 导入」
-2. 选择 `dist/cloud_wuwa-1.2.0.okscript`
-3. 重启 ok-ww
+二选一：
 
-重启后左侧栏会出现「云鸣潮」页。
+- **从 GitHub 安装**：左侧栏「插件」→「从 GitHub 安装」，填 `https://github.com/XiaoYu-04/ok-cloud-wuwa`
+- **从本地安装**：从 [Releases](https://github.com/XiaoYu-04/ok-cloud-wuwa/releases/latest) 下载
+  `cloud_wuwa-<版本>.okscript`（或 `.zip`，同一份文件），再「从 ZIP 导入」
+
+然后重启 ok-ww，左侧栏会出现「云鸣潮」页。
 
 ## 使用
 
@@ -43,7 +49,8 @@ UI 上也就看不到。
 
 - **仅 Windows**。
 - **需要系统装有 Chrome 或 Edge**。
-- `supported_resolution` 要求 16:9，所以请保持 1280x720 / 1600x900 / 1920x1080 / 2560x1440。
+- **浏览器窗口不能最小化**：最小化后 Chromium 停止渲染，截图会挂死等 `Page.screenshot`
+  超时。插件会自动还原窗口，但最小化期间出不了帧。
 - 云游戏串流画质受网络影响，OCR 识别率可能不如本地。
 - 交互方式是 `BrowserInteraction`（Playwright 注入），不是 PostMessage。
 

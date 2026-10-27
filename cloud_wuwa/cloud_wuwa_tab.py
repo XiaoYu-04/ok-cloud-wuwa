@@ -407,6 +407,10 @@ class EmbeddedChild:
         窗口比可见区域大一圈：左/右各 7px 描边、顶部 30px 自绘标题栏、底部 7px
         描边。所以窗口要往左上各推 7/30，多出来的部分由父窗口客户区剪掉，剩下的
         可见区域正好是页面。
+
+        光靠偏移不够：页面在承载区里垂直居中时 y 可能大于 30，标题栏又会落回
+        可见区域内，而 Chrome 对它返回 HTCAPTION——子窗口于是能被鼠标拖走。
+        所以再给窗口设一个只含页面的区域，把标题栏和描边从窗口自身切掉。
         """
         if not self.attached:
             return False
@@ -420,7 +424,24 @@ class EmbeddedChild:
             int(shown_w) + EMBED_OVERHEAD_W, int(shown_h) + EMBED_OVERHEAD_H,
             win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_NOACTIVATE,
         )
+        self._apply_region(int(shown_w), int(shown_h))
         return True
+
+    def _apply_region(self, shown_w, shown_h):
+        """把窗口区域裁成只剩页面那一块，标题栏和描边不再响应鼠标。"""
+        try:
+            import ctypes
+        except ImportError:
+            return
+        try:
+            rgn = ctypes.windll.gdi32.CreateRectRgn(
+                EMBED_PAGE_LEFT, EMBED_PAGE_TOP,
+                EMBED_PAGE_LEFT + max(shown_w, 1), EMBED_PAGE_TOP + max(shown_h, 1),
+            )
+            if not ctypes.windll.user32.SetWindowRgn(self.hwnd, rgn, True):
+                ctypes.windll.gdi32.DeleteObject(rgn)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"set window region failed: {e}")
 
     def set_visible(self, visible):
         """子窗口不参与 Qt 的 z-order：切走标签页时必须显式隐藏，否则会盖在别的页面上。"""
